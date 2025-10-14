@@ -2698,7 +2698,7 @@ static void free_empty_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf)
 }
 
 static int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags,
-				   size_t size, void **p);
+				   size_t size, void **p, bool sheaf_canary);
 
 
 static int refill_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf,
@@ -2711,7 +2711,7 @@ static int refill_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf,
 		return 0;
 
 	filled = __kmem_cache_alloc_bulk(s, gfp, to_fill,
-					 &sheaf->objects[sheaf->size]);
+					 &sheaf->objects[sheaf->size], true);
 
 	sheaf->size += filled;
 
@@ -2815,6 +2815,7 @@ static void __rcu_free_sheaf_prepare(struct kmem_cache *s,
 	bool init = slab_want_init_on_free(s);
 	void **p = &sheaf->objects[0];
 	unsigned int i = 0;
+	bool canary = true;
 
 	while (i < sheaf->size) {
 		struct slab *slab = virt_to_slab(p[i]);
@@ -2822,7 +2823,10 @@ static void __rcu_free_sheaf_prepare(struct kmem_cache *s,
 		memcg_slab_free_hook(s, slab, p + i, 1);
 		alloc_tagging_slab_free_hook(s, slab, p + i, 1);
 
-		if (unlikely(!slab_free_hook(s, p[i], init, true))) {
+		/* Make sure canaries are not used on kfence objects. */
+		if (is_kfence_address(p[i]))
+			canary = false;
+		if (unlikely(!slab_free_hook(s, p[i], init, true, canary))) {
 			p[i] = p[--sheaf->size];
 			continue;
 		}
@@ -5480,7 +5484,7 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size)
 		sheaf->capacity = size;
 
 		if (!__kmem_cache_alloc_bulk(s, gfp, size,
-					     &sheaf->objects[0])) {
+					     &sheaf->objects[0], true)) {
 			kfree(sheaf);
 			return NULL;
 		}
@@ -5614,7 +5618,7 @@ int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
 			return refill_sheaf(s, sheaf, gfp);
 
 		if (!__kmem_cache_alloc_bulk(s, gfp, sheaf->capacity - sheaf->size,
-					     &sheaf->objects[sheaf->size])) {
+					     &sheaf->objects[sheaf->size], true)) {
 			return -ENOMEM;
 		}
 		sheaf->size = sheaf->capacity;
@@ -5656,6 +5660,11 @@ kmem_cache_alloc_from_sheaf_noprof(struct kmem_cache *s, gfp_t gfp,
 		goto out;
 
 	ret = sheaf->objects[--sheaf->size];
+
+	if (ret) {
+		check_canary(s, ret, s->random_inactive);
+		set_canary(s, ret, s->random_active);
+	}
 
 	init = slab_want_init_on_alloc(gfp, s);
 
@@ -6426,6 +6435,7 @@ static void free_to_pcs_bulk(struct kmem_cache *s, size_t size, void **p)
 	void *remote_objects[PCS_BATCH_MAX];
 	unsigned int remote_nr = 0;
 	int node = numa_mem_id();
+	bool canary = true;
 
 next_remote_batch:
 	while (i < size) {
@@ -6434,7 +6444,10 @@ next_remote_batch:
 		memcg_slab_free_hook(s, slab, p + i, 1);
 		alloc_tagging_slab_free_hook(s, slab, p + i, 1);
 
-		if (unlikely(!slab_free_hook(s, p[i], init, false))) {
+		/* Make sure canaries are not used on kfence objects. */
+		if (is_kfence_address(p[i]))
+			canary = false;
+		if (unlikely(!slab_free_hook(s, p[i], init, false, canary))) {
 			p[i] = p[--size];
 			continue;
 		}
@@ -7489,7 +7502,7 @@ EXPORT_SYMBOL(kmem_cache_free_bulk);
 #ifndef CONFIG_SLUB_TINY
 static inline
 int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
-			    void **p)
+			    void **p, bool sheaf_canary)
 {
 	struct kmem_cache_cpu *c;
 	unsigned long irqflags;
@@ -7567,7 +7580,12 @@ int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 	for (k = 0; k < i; k++) {
 		if (!is_kfence_address(p[k])) {
 			check_canary(s, p[k], s->random_inactive);
-			set_canary(s, p[k], s->random_active);
+			/**
+			 * linux-hardened: INFO: If allocated for a sheaf, do not set the canary to active
+			 * since it will be allocated later from kmem_cache_alloc_from_sheaf.
+			 **/
+			if (!sheaf_canary)
+				set_canary(s, p[k], s->random_active);
 		}
 	}
 
@@ -7581,7 +7599,7 @@ error:
 }
 #else /* CONFIG_SLUB_TINY */
 static int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags,
-				   size_t size, void **p)
+				   size_t size, void **p, bool activate_canary)
 {
 	int i;
 
@@ -7631,7 +7649,7 @@ int kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags, size_t size,
 		 * If we ran out of memory, don't bother with freeing back to
 		 * the percpu sheaves, we have bigger problems.
 		 */
-		if (unlikely(__kmem_cache_alloc_bulk(s, flags, size - i, p + i) == 0)) {
+		if (unlikely(__kmem_cache_alloc_bulk(s, flags, size - i, p + i, false) == 0)) {
 			if (i > 0)
 				__kmem_cache_free_bulk(s, i, p);
 			return 0;
