@@ -1,6 +1,11 @@
 # linux-hardened – v6.18.* Rebase Experiment
 
-⚠️ **EXPERIMENTAL – NOT OFFICIAL – DO NOT RELY ON THIS TREE** ⚠️
+⚠️ **EXPERIMENTAL – NOT OFFICIAL – DO NOT RELY ON THIS TREE**
+
+Please be careful if you try using the patch - I am waiting for linux-hardened
+to release an official patch I can compare to. Based on the 102 commits to the
+"6.18" branch and the successful rebase, it appears as if the patch was mostly
+complete but it is important to run a diff against theirs when it is released!
 
 This branch contains an **experimental, manual rebase** of the
 [linux-hardened](https://github.com/anthraxx/linux-hardened) `6.18` patchset
